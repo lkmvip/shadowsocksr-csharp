@@ -111,6 +111,7 @@ namespace Shadowsocks.Model
         public int localPort;
         public string localAuthPassword;
 
+        public string localDnsServer;
         public string dnsServer;
         public int reconnectTimes;
         public string balanceAlgorithm;
@@ -133,6 +134,8 @@ namespace Shadowsocks.Model
         public string authPass;
 
         public bool autoBan;
+        public bool checkSwitchAutoCloseAll;
+        public bool logEnable;
         public bool sameHostForSameTarget;
 
         public int keepVisitTime;
@@ -146,11 +149,11 @@ namespace Shadowsocks.Model
         public Dictionary<string, PortMapConfig> portMap = new Dictionary<string, PortMapConfig>();
 
         private Dictionary<int, ServerSelectStrategy> serverStrategyMap = new Dictionary<int, ServerSelectStrategy>();
-        private Dictionary<string, UriVisitTime> uri2time = new Dictionary<string, UriVisitTime>();
-        private SortedDictionary<UriVisitTime, string> time2uri = new SortedDictionary<UriVisitTime, string>();
         private Dictionary<int, PortMapConfigCache> portMapCache = new Dictionary<int, PortMapConfigCache>();
+        private LRUCache<string, UriVisitTime> uricache = new LRUCache<string, UriVisitTime>(180);
 
         private static string CONFIG_FILE = "gui-config.json";
+        private static string CONFIG_FILE_BACKUP = "gui-config.json.backup";
 
         public static void SetPassword(string password)
         {
@@ -174,9 +177,9 @@ namespace Shadowsocks.Model
                         serverStrategyMap[localPort] = new ServerSelectStrategy();
                     ServerSelectStrategy serverStrategy = serverStrategyMap[localPort];
 
-                    if (uri2time.ContainsKey(targetAddr))
+                    if (uricache.ContainsKey(targetAddr))
                     {
-                        UriVisitTime visit = uri2time[targetAddr];
+                        UriVisitTime visit = uricache.Get(targetAddr);
                         int index = -1;
                         for (int i = 0; i < configs.Count; ++i)
                         {
@@ -188,11 +191,7 @@ namespace Shadowsocks.Model
                         }
                         if (index >= 0 && visit.index == index && configs[index].enable)
                         {
-                            time2uri.Remove(visit);
-                            visit.index = index;
-                            visit.visitTime = DateTime.Now;
-                            uri2time[targetAddr] = visit;
-                            time2uri[visit] = targetAddr;
+                            uricache.Del(targetAddr);
                             return true;
                         }
                     }
@@ -209,25 +208,14 @@ namespace Shadowsocks.Model
                     serverStrategyMap[localPort] = new ServerSelectStrategy();
                 ServerSelectStrategy serverStrategy = serverStrategyMap[localPort];
 
-                foreach (KeyValuePair<UriVisitTime, string> p in time2uri)
+                uricache.SetTimeout(keepVisitTime);
+                uricache.Sweep();
+                if (sameHostForSameTarget && !forceRandom && targetAddr != null && uricache.ContainsKey(targetAddr))
                 {
-                    if ((DateTime.Now - p.Key.visitTime).TotalSeconds < keepVisitTime)
-                        break;
-
-                    uri2time.Remove(p.Value);
-                    time2uri.Remove(p.Key);
-                    break;
-                }
-                if (sameHostForSameTarget && !forceRandom && targetAddr != null && uri2time.ContainsKey(targetAddr))
-                {
-                    UriVisitTime visit = uri2time[targetAddr];
+                    UriVisitTime visit = uricache.Get(targetAddr);
                     if (visit.index < configs.Count && configs[visit.index].enable && configs[visit.index].ServerSpeedLog().ErrorContinurousTimes == 0)
                     {
-                        //uri2time.Remove(targetURI);
-                        time2uri.Remove(visit);
-                        visit.visitTime = DateTime.Now;
-                        uri2time[targetAddr] = visit;
-                        time2uri[visit] = targetAddr;
+                        uricache.Del(targetAddr);
                         return configs[visit.index];
                     }
                 }
@@ -273,12 +261,7 @@ namespace Shadowsocks.Model
                         visit.uri = targetAddr;
                         visit.index = index;
                         visit.visitTime = DateTime.Now;
-                        if (uri2time.ContainsKey(targetAddr))
-                        {
-                            time2uri.Remove(uri2time[targetAddr]);
-                        }
-                        uri2time[targetAddr] = visit;
-                        time2uri[visit] = targetAddr;
+                        uricache.Set(targetAddr, visit);
                     }
                     return configs[index];
                 }
@@ -308,12 +291,7 @@ namespace Shadowsocks.Model
                             visit.uri = targetAddr;
                             visit.index = selIndex;
                             visit.visitTime = DateTime.Now;
-                            if (uri2time.ContainsKey(targetAddr))
-                            {
-                                time2uri.Remove(uri2time[targetAddr]);
-                            }
-                            uri2time[targetAddr] = visit;
-                            time2uri[visit] = targetAddr;
+                            uricache.Set(targetAddr, visit);
                         }
                         return configs[selIndex];
                     }
@@ -380,6 +358,8 @@ namespace Shadowsocks.Model
                 if (!portMapCache.ContainsKey(localPort))
                     serverStrategyMap.Remove(localPort);
             }
+
+            uricache.Clear();
         }
 
         public Dictionary<int, PortMapConfigCache> GetPortMapCache()
@@ -413,6 +393,7 @@ namespace Shadowsocks.Model
             keepVisitTime = 180;
             connectTimeout = 5;
             dnsServer = "";
+            localDnsServer = "";
 
             balanceAlgorithm = "LowException";
             random = true;
@@ -445,6 +426,7 @@ namespace Shadowsocks.Model
             TTL = config.TTL;
             connectTimeout = config.connectTimeout;
             dnsServer = config.dnsServer;
+            localDnsServer = config.localDnsServer;
             proxyEnable = config.proxyEnable;
             pacDirectGoProxy = config.pacDirectGoProxy;
             proxyType = config.proxyType;
@@ -456,6 +438,8 @@ namespace Shadowsocks.Model
             authUser = config.authUser;
             authPass = config.authPass;
             autoBan = config.autoBan;
+            checkSwitchAutoCloseAll = config.checkSwitchAutoCloseAll;
+            logEnable = config.logEnable;
             sameHostForSameTarget = config.sameHostForSameTarget;
             keepVisitTime = config.keepVisitTime;
             isHideTips = config.isHideTips;
@@ -581,6 +565,20 @@ namespace Shadowsocks.Model
                 {
                     sw.Write(jsonString);
                     sw.Flush();
+                }
+
+                if (File.Exists(CONFIG_FILE_BACKUP))
+                {
+                    DateTime dt = File.GetLastWriteTimeUtc(CONFIG_FILE_BACKUP);
+                    DateTime now = DateTime.Now;
+                    if ((now - dt).TotalHours > 4)
+                    {
+                        File.Copy(CONFIG_FILE, CONFIG_FILE_BACKUP, true);
+                    }
+                }
+                else
+                {
+                    File.Copy(CONFIG_FILE, CONFIG_FILE_BACKUP, true);
                 }
             }
             catch (IOException e)
